@@ -1,0 +1,99 @@
+# CLAUDE.md
+
+## Structure
+
+```
+.venv/                    # virtual environment
+requirements.txt          # dependencies
+dictate.py                # main app
+```
+
+## Run
+
+```bash
+source .venv/bin/activate && python dictate.py
+```
+
+## Rules
+
+### No Background Tasks
+
+- **Never run commands in the background** - always run commands in the foreground
+- **Wait for completion** - let each command finish before moving on
+
+### No Wildcard Imports
+
+- **Never use `from x import *`** - always import specific names explicitly
+
+❌ Bad:
+```python
+from typing import *
+```
+
+✅ Good:
+```python
+import typing
+```
+
+### No Comments
+
+- **Never add comments to code** - no exceptions
+- **Never add docstrings** - no exceptions
+- Code should be self-explanatory through clear naming and structure
+
+### No Single-Use Variables
+
+- If a variable is only read once, return or use the expression directly
+
+❌ Bad:
+```python
+def get_data():
+    result = calculate_something()
+    return result
+```
+
+✅ Good:
+```python
+def get_data():
+    return calculate_something()
+```
+
+### Happy Path
+
+- **Focus on the happy path** - write if conditions for when you do actual work
+- **Less code is better**
+
+### No Try-Except
+
+- **Never add try-except blocks** unless the user explicitly requests error handling
+- **Let exceptions propagate naturally**
+- **Fail fast and loud**
+
+### No Single-Use Functions
+
+- If a function is only used once and is not longer than 10 lines, integrate it inline
+
+### Use Default Parameters
+
+- Use default parameter values instead of checking if a parameter is None
+
+### Prefer Ternary
+
+- **Use ternary operator for simple conditional assignments**
+
+### No Shebang
+
+- **Never add shebang lines** - don't include `#!/usr/bin/env python3`
+
+### Prefer Comprehensions
+
+- **Use list/dict comprehensions instead of loops** when building collections
+
+### Single Line Print
+
+- **Combine related prints into a single line** when possible
+
+### Simplicity First
+
+- **Less is more** - always prefer the simplest solution
+- **Code should be beautiful** - treat it like an art piece

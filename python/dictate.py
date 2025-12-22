@@ -4,6 +4,7 @@ import mlx_whisper
 import threading
 import subprocess
 import rumps
+import logging
 from pynput import keyboard
 from pynput.keyboard import Controller, Key
 from AppKit import NSEvent, NSWindow, NSView, NSColor, NSBezierPath, NSFont, NSString, NSMakeRect, NSObject
@@ -16,8 +17,18 @@ import objc
 HOTKEY = keyboard.Key.alt_r
 SAMPLE_RATE = 16000
 MODEL = "mlx-community/whisper-large-v3-mlx"
+MIN_RECORD_SECONDS = 0.3
 TRANSCRIPTS_DIR = Path.home() / ".dictate_transcripts"
 ICONS_DIR = Path(__file__).parent / "icons" / "menubar"
+LOG_FILE = Path(__file__).parent / "dictate.log"
+
+LOG_FILE.parent.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("dictate")
 
 
 class LoadingView(NSView):
@@ -110,32 +121,51 @@ class DictateApp(rumps.App):
         self.recording = True
         self.icon = str(ICONS_DIR / "speaking.png")
         self.record_button.title = "Stop Recording"
+        logger.info("Recording started")
 
     def stop_recording(self):
         self.recording = False
         self.icon = str(ICONS_DIR / "mic.png")
         self.record_button.title = "Start Recording"
+        logger.info("Recording stopped")
         if self.audio_data:
             self.loading.show()
             threading.Thread(target=self.transcribe_and_paste, daemon=True).start()
+        else:
+            logger.info("Stop pressed but no audio captured")
 
     def transcribe_and_paste(self):
         if not self.audio_data:
+            logger.info("Transcribe called with no audio data")
             self.loading.hide()
             return
 
         audio = np.concatenate(self.audio_data, axis=0).flatten().astype(np.float32)
+        duration = len(audio) / SAMPLE_RATE
+        logger.info(f"Audio captured: {len(audio)} samples ({duration:.2f}s)")
+        if duration < MIN_RECORD_SECONDS:
+            logger.info("Audio too short, skipping transcription")
+            rumps.notification("Dictate", "Recording too short", "Hold Option+R a bit longer")
+            self.loading.hide()
+            return
+
         result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language="en")
         text = result["text"].strip()
-
-        self.loading.hide()
+        logger.info(f"Transcription returned {len(text)} characters")
 
         if text:
             TRANSCRIPTS_DIR.mkdir(exist_ok=True)
-            (TRANSCRIPTS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt").write_text(text)
+            transcript_path = TRANSCRIPTS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+            transcript_path.write_text(text)
             subprocess.run(["pbcopy"], input=text.encode(), check=True)
             with self.typer.pressed(Key.cmd):
                 self.typer.tap("v")
+            logger.info(f"Transcript saved to {transcript_path}")
+        else:
+            rumps.notification("Dictate", "No transcription result", "Try again or speak longer")
+            logger.info("No text returned from transcription")
+
+        self.loading.hide()
 
     def quit_app(self, _):
         self.stream.stop()

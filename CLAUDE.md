@@ -10,9 +10,18 @@
 
 ### Cursor Lock During Transcription
 
-- App pastes text where the cursor is focused when transcription finishes
-- User cannot move cursor or switch windows while waiting for paste
-- Forced to stay idle until transcription completes, blocking other work
+**What works:**
+- Switching to a different app during transcription → paste returns to original app ✓
+
+**What doesn't work:**
+- Switching windows within the same app (e.g., iTerm windows) → cannot detect, pastes in wrong window
+- iTerm reports all windows with same ID (4444) to Accessibility API, making detection impossible
+- AppleScript approach requires authorization that users likely won't grant
+
+**Attempted solutions:**
+- CGWindowListCopyWindowInfo - returns helper windows (toolbars), not main windows
+- AXFocusedWindow - works for cross-app, but iTerm returns same ID for all windows
+- AppleScript for iTerm - "Not authorized to send Apple events"
 
 ## Structure
 

@@ -78,6 +78,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     private var languageMenu: NSMenu?
+    private var recentMenu: NSMenu?
+    private var recentTranscriptions: [(timestamp: String, text: String)] = []
+    private var autoSendMenuItem: NSMenuItem?
+    private var autoSend: Bool {
+        get { UserDefaults.standard.bool(forKey: "autoSend") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "autoSend")
+            autoSendMenuItem?.state = newValue ? .on : .off
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -119,6 +129,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenu?.addItem(langItem)
         updateLanguageMenu()
 
+        let recentItem = NSMenuItem(title: "Recent Transcriptions", action: nil, keyEquivalent: "")
+        recentMenu = NSMenu()
+        recentItem.submenu = recentMenu
+        statusMenu?.addItem(recentItem)
+        loadRecentTranscriptions()
+
+        autoSendMenuItem = NSMenuItem(title: "Auto-Send (Press Enter)", action: #selector(toggleAutoSend), keyEquivalent: "")
+        autoSendMenuItem?.target = self
+        autoSendMenuItem?.state = autoSend ? .on : .off
+        statusMenu?.addItem(autoSendMenuItem!)
+
         statusMenu?.addItem(NSMenuItem.separator())
         statusMenu?.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusMenu?.items.forEach { $0.target = self }
@@ -140,11 +161,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectedLanguage = sender.representedObject as? String
     }
 
+    @objc private func toggleAutoSend() {
+        autoSend = !autoSend
+    }
+
     private func updateLanguageMenu() {
         languageMenu?.items.forEach { item in
             let code = item.representedObject as? String
             item.state = (code == selectedLanguage) ? .on : .off
         }
+    }
+
+    private func loadRecentTranscriptions() {
+        recentTranscriptions = []
+        guard FileManager.default.fileExists(atPath: transcriptsDir.path) else {
+            updateRecentMenu()
+            return
+        }
+        let files = (try? FileManager.default.contentsOfDirectory(at: transcriptsDir, includingPropertiesForKeys: [.contentModificationDateKey]))?.filter { $0.pathExtension == "txt" }.sorted { a, b in
+            let dateA = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
+            let dateB = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
+            return dateA > dateB
+        }.prefix(5) ?? []
+        recentTranscriptions = files.compactMap { file in
+            guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+            return (file.deletingPathExtension().lastPathComponent, text)
+        }
+        updateRecentMenu()
+    }
+
+    private func updateRecentMenu() {
+        recentMenu?.removeAllItems()
+        if recentTranscriptions.isEmpty {
+            recentMenu?.addItem(NSMenuItem(title: "No transcriptions yet", action: nil, keyEquivalent: ""))
+            return
+        }
+        for (_, text) in recentTranscriptions {
+            var preview = text.replacingOccurrences(of: "\n", with: " ")
+            if preview.count > 50 { preview = String(preview.prefix(50)) + "..." }
+            let item = NSMenuItem(title: preview, action: #selector(copyTranscription(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = text
+            recentMenu?.addItem(item)
+        }
+    }
+
+    @objc private func copyTranscription(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        let pb = NSPasteboard.general
+        pb.declareTypes([.string], owner: nil)
+        pb.setString(text, forType: .string)
+        showNotification(title: "Whisper", message: "Copied to clipboard!")
     }
 
     private func setupHotkeyMonitor() {
@@ -343,14 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 showNotification(title: "Whisper", message: "No speech detected. Try again.")
             } else {
                 saveTranscript(text)
-                if windowChanged() {
-                    copyToClipboard(text)
-                    showNotification(title: "Whisper", message: "Window changed - copied to clipboard")
-                    logFocusDebug("Window changed within same app, skipping paste")
-                } else {
-                    restoreSavedWindow()
-                    copyAndPaste(text)
-                }
+                restoreSavedWindow()
+                copyAndPaste(text)
             }
         } catch {
             appLogger.error("Transcription failed: \(error.localizedDescription)")
@@ -380,9 +441,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: transcriptsDir, withIntermediateDirectories: true)
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let path = transcriptsDir.appendingPathComponent("\(formatter.string(from: Date())).txt")
+        let timestamp = formatter.string(from: Date())
+        let path = transcriptsDir.appendingPathComponent("\(timestamp).txt")
         try? text.write(to: path, atomically: true, encoding: .utf8)
         appLogger.info("Saved transcript to \(path.path)")
+        recentTranscriptions.insert((timestamp, text), at: 0)
+        if recentTranscriptions.count > 5 { recentTranscriptions = Array(recentTranscriptions.prefix(5)) }
+        updateRecentMenu()
     }
 
     private func copyAndPaste(_ text: String) {
@@ -410,6 +475,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
         appLogger.info("Paste sent")
+
+        if autoSend {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                let enterSrc = CGEventSource(stateID: .hidSystemState)
+                let enterDown = CGEvent(keyboardEventSource: enterSrc, virtualKey: 36, keyDown: true)
+                let enterUp = CGEvent(keyboardEventSource: enterSrc, virtualKey: 36, keyDown: false)
+                enterDown?.flags = []
+                enterUp?.flags = []
+                enterDown?.post(tap: .cghidEventTap)
+                enterUp?.post(tap: .cghidEventTap)
+                appLogger.info("Enter sent")
+            }
+        }
     }
 
     private func showNotification(title: String, message: String) {

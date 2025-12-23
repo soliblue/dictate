@@ -1,4 +1,10 @@
-openai-whisper
+mlx-whisper
 sounddevice
 numpy
 pynput
+rumps
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+google-genai
+Pillow
+requests

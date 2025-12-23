@@ -84,11 +84,14 @@ class DictateApp(rumps.App):
     def __init__(self):
         super().__init__("", icon=str(ICONS_DIR / "loading.png"), quit_button=None, template=False)
         self.record_button = rumps.MenuItem("Start Recording", callback=self.toggle_recording)
-        self.menu = [self.record_button, None, rumps.MenuItem("Quit", callback=self.quit_app)]
+        self.recent_menu = rumps.MenuItem("Recent Transcriptions")
+        self.recent_transcriptions = []
+        self.menu = [self.record_button, self.recent_menu, None, rumps.MenuItem("Quit", callback=self.quit_app)]
         self.recording = False
         self.audio_data = []
         self.typer = Controller()
         self.loading = LoadingIndicator()
+        self.load_recent_transcriptions()
 
         mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), path_or_hf_repo=MODEL)
         self.icon = str(ICONS_DIR / "mic.png")
@@ -97,6 +100,27 @@ class DictateApp(rumps.App):
         self.stream.start()
         self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
         self.listener.start()
+
+    def load_recent_transcriptions(self):
+        if TRANSCRIPTS_DIR.exists():
+            files = sorted(TRANSCRIPTS_DIR.glob("*.txt"), key=lambda f: f.stat().st_mtime, reverse=True)[:5]
+            self.recent_transcriptions = [(f.stem, f.read_text()) for f in files]
+        self.update_recent_menu()
+
+    def update_recent_menu(self):
+        self.recent_menu.clear()
+        if not self.recent_transcriptions:
+            self.recent_menu.add(rumps.MenuItem("No transcriptions yet", callback=None))
+            return
+        for timestamp, text in self.recent_transcriptions:
+            preview = text[:50] + "..." if len(text) > 50 else text
+            preview = preview.replace("\n", " ")
+            item = rumps.MenuItem(preview, callback=lambda _, t=text: self.copy_transcription(t))
+            self.recent_menu.add(item)
+
+    def copy_transcription(self, text):
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        rumps.notification("Dictate", "Copied!", text[:100] + ("..." if len(text) > 100 else ""))
 
     def audio_callback(self, indata, frames, time, status):
         if self.recording:
@@ -155,11 +179,15 @@ class DictateApp(rumps.App):
 
         if text:
             TRANSCRIPTS_DIR.mkdir(exist_ok=True)
-            transcript_path = TRANSCRIPTS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            transcript_path = TRANSCRIPTS_DIR / f"{timestamp}.txt"
             transcript_path.write_text(text)
             subprocess.run(["pbcopy"], input=text.encode(), check=True)
             with self.typer.pressed(Key.cmd):
                 self.typer.tap("v")
+            self.recent_transcriptions.insert(0, (timestamp, text))
+            self.recent_transcriptions = self.recent_transcriptions[:5]
+            self.update_recent_menu()
             logger.info(f"Transcript saved to {transcript_path}")
         else:
             rumps.notification("Dictate", "No transcription result", "Try again or speak longer")

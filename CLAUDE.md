@@ -1,5 +1,19 @@
 # CLAUDE.md
 
+## Open Challenges
+
+### Real-Time Transcription vs Accuracy
+
+- Current approach requires waiting several seconds after speaking before transcription completes
+- Unable to achieve real-time streaming transcription while maintaining accuracy
+- This wait time is a significant UX issue - feels like wasted time
+
+### Cursor Lock During Transcription
+
+- App pastes text where the cursor is focused when transcription finishes
+- User cannot move cursor or switch windows while waiting for paste
+- Forced to stay idle until transcription completes, blocking other work
+
 ## Structure
 
 ```
@@ -15,6 +29,13 @@ source .venv/bin/activate && python dictate.py
 ```
 
 ## Rules
+
+### Multi-Agent Environment
+
+- **Multiple agents work on this codebase simultaneously**
+- If you encounter a build error or test failure in a file you haven't touched, **do not fix it** - confirm with the user first
+- Avoid getting stuck in loops trying to fix issues caused by other agents' in-progress work
+- When in doubt about an unexpected error, ask before attempting repairs
 
 ### No Background Tasks
 

@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		FBF5FB882EFB250B00FB4CDD /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = FB72D2C12EF7F00000000002 /* WhisperKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		FB72D2AD2EF7E68B00E76BE5 /* Whisper.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Whisper.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FBF5FB882EFB250B00FB4CDD /* WhisperKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -95,11 +100,11 @@
 			);
 			mainGroup = FB72D2A42EF7E68B00E76BE5;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
-			productRefGroup = FB72D2AE2EF7E68B00E76BE5 /* Products */;
 			packageReferences = (
 				FB72D2C02EF7F00000000001 /* XCRemoteSwiftPackageReference "WhisperKit" */,
 			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = FB72D2AE2EF7E68B00E76BE5 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -264,6 +269,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Whisper;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Whisper needs microphone access to record and transcribe your speech.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -298,6 +305,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Whisper;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Whisper needs microphone access to record and transcribe your speech.";
 				LD_RUNPATH_SEARCH_PATHS = (

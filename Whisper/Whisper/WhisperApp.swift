@@ -293,7 +293,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             do {
                 let resampled = AudioProcessor.resampleTo16kHz(samples: chunkToTranscribe, fromRate: sampleRate)
-                let options = DecodingOptions(language: selectedLanguage)
+                var options = DecodingOptions(language: selectedLanguage)
+                options.verbose = false
                 let results = try await whisperKit.transcribe(audioArray: resampled, decodeOptions: options)
                 let chunkText = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
 

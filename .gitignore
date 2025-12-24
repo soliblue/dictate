@@ -12,3 +12,10 @@ env/
 # Local run artifacts
 /.dictate_transcripts/
 *.log
+
+# Build artifacts
+*.app
+*.pkg
+*.dSYM.zip
+*.xcarchive
+fastlane/report.xml

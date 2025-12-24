@@ -2,30 +2,14 @@ import SwiftUI
 import AppKit
 import AVFoundation
 import WhisperKit
-import os.log
 import Quartz
 import UserNotifications
 
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
-private let appLogger = Logger(subsystem: "soli.whisper.Whisper", category: "app")
 let minRecordSeconds = 0.3
 let transcriptsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dictate_transcripts", isDirectory: true)
-let focusDebugLog = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dictate_transcripts/focus_debug.log")
-
-func logFocusDebug(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
-    try? FileManager.default.createDirectory(at: transcriptsDir, withIntermediateDirectories: true)
-    if let handle = try? FileHandle(forWritingTo: focusDebugLog) {
-        handle.seekToEndOfFile()
-        handle.write(line.data(using: .utf8)!)
-        handle.closeFile()
-    } else {
-        try? line.write(to: focusDebugLog, atomically: true, encoding: .utf8)
-    }
-}
 
 let supportedLanguages: [(code: String?, name: String)] = [
     (nil, "Auto-detect"),
@@ -83,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isChunkTranscribing = false
     private let chunkDurationSeconds: Double = 5.0
     private let overlapDurationSeconds: Double = 1.5
+    private var recordingSessionId: Int = 0
     private var selectedLanguage: String? {
         get { UserDefaults.standard.string(forKey: "selectedLanguage") }
         set {
@@ -248,14 +233,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadWhisperModel() async {
-        appLogger.info("Loading Whisper model...")
         do {
             whisperKit = try await WhisperKit(model: "large-v3")
-            appLogger.info("Whisper model loaded")
             updateIcon(.ready)
             launcherPanel?.hideLoading()
         } catch {
-            appLogger.error("Failed to load Whisper model: \(error.localizedDescription)")
             showNotification(title: "Whisper", message: "Failed to load model: \(error.localizedDescription)")
             launcherPanel?.hideLoading()
         }
@@ -269,6 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logFocusInfo()
         recorder.start()
         isRecording = true
+        recordingSessionId += 1
         lastChunkEndSample = 0
         accumulatedTranscription = ""
         isChunkTranscribing = false
@@ -276,7 +259,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu?.item(at: 0)?.title = "Stop Recording"
         screenGlow?.show(mode: .recording)
         launcherPanel?.showRecording()
-        appLogger.info("Recording started")
         startChunkTimer()
     }
 
@@ -307,6 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastChunkEndSample = samples.count
 
         isChunkTranscribing = true
+        let sessionId = recordingSessionId
         Task {
             do {
                 let resampled = AudioProcessor.resampleTo16kHz(samples: chunkToTranscribe, fromRate: sampleRate)
@@ -315,6 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let chunkText = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
 
                 await MainActor.run {
+                    guard sessionId == recordingSessionId else { return }
                     if !chunkText.isEmpty {
                         accumulatedTranscription = mergeTranscriptions(existing: accumulatedTranscription, new: chunkText)
                         launcherPanel?.updateLiveText(accumulatedTranscription)
@@ -365,9 +349,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
         savedAppPid = frontApp.processIdentifier
 
-        logFocusDebug("=== Recording Started ===")
-        logFocusDebug("App: \(frontApp.localizedName ?? "nil") | bundle: \(frontApp.bundleIdentifier ?? "nil") | pid: \(savedAppPid)")
-
         let appRef = AXUIElementCreateApplication(savedAppPid)
         var focusedWindowRef: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindowRef)
@@ -378,9 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var titleRef: CFTypeRef?
             _ = AXUIElementCopyAttributeValue(savedWindow!, kAXTitleAttribute as CFString, &titleRef)
             savedWindowTitle = titleRef as? String ?? ""
-            logFocusDebug("Focused window: id=\(savedWindowId) title=\(savedWindowTitle)")
         } else {
-            logFocusDebug("Could not get focused window: \(result.rawValue)")
             savedWindow = nil
             savedWindowId = 0
             savedWindowTitle = ""
@@ -390,26 +369,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func windowChanged() -> Bool {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return true }
 
-        if frontApp.processIdentifier != savedAppPid {
-            logFocusDebug("Different app - will restore")
-            return false
-        }
+        if frontApp.processIdentifier != savedAppPid { return false }
 
         let appRef = AXUIElementCreateApplication(frontApp.processIdentifier)
         var focusedWindowRef: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindowRef)
 
-        guard result == .success, let window = focusedWindowRef else {
-            logFocusDebug("Could not get current focused window")
-            return false
-        }
+        guard result == .success, let window = focusedWindowRef else { return false }
 
         var currentWindowId: CGWindowID = 0
         _ = _AXUIElementGetWindow(window as! AXUIElement, &currentWindowId)
 
-        let changed = currentWindowId != savedWindowId
-        logFocusDebug("Window check: saved=\(savedWindowId) current=\(currentWindowId) changed=\(changed)")
-        return changed
+        return currentWindowId != savedWindowId
     }
 
     private func copyToClipboard(_ text: String) {
@@ -426,10 +397,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sampleRate = recorder.sampleRate
         isRecording = false
         statusItem.menu?.item(at: 0)?.title = "Start Recording"
-        appLogger.info("Recording stopped, samples: \(allSamples.count)")
 
         guard !allSamples.isEmpty else {
-            appLogger.info("No audio captured")
             accumulatedTranscription = ""
             if !isTranscribing {
                 screenGlow?.hide()
@@ -440,10 +409,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let duration = Double(allSamples.count) / sampleRate
-        appLogger.info("Audio duration: \(String(format: "%.2f", duration))s")
 
         if duration < minRecordSeconds {
-            appLogger.info("Audio too short")
             accumulatedTranscription = ""
             if !isTranscribing {
                 screenGlow?.hide()
@@ -457,7 +424,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let overlapSamples = Int(overlapDurationSeconds * sampleRate)
         let startSample = max(0, lastChunkEndSample - overlapSamples)
         let remainingSamples = startSample < allSamples.count ? Array(allSamples[startSample...]) : []
-        appLogger.info("Remaining samples to transcribe: \(remainingSamples.count) (from \(startSample))")
 
         let queueItem = TranscriptionQueueItem(
             samples: remainingSamples.isEmpty ? allSamples : remainingSamples,
@@ -468,7 +434,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             savedWindowTitle: savedWindowTitle
         )
         transcriptionQueue.append(queueItem)
-        appLogger.info("Added to queue, queue size: \(self.transcriptionQueue.count)")
 
         if !isTranscribing {
             processNextInQueue()
@@ -501,7 +466,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func transcribe(item: TranscriptionQueueItem) async {
         guard let whisperKit else {
-            appLogger.error("WhisperKit not initialized")
             processNextInQueue()
             return
         }
@@ -510,24 +474,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let resampled = AudioProcessor.resampleTo16kHz(samples: item.samples, fromRate: item.sampleRate)
             let options = DecodingOptions(language: selectedLanguage)
 
-            let callback: TranscriptionCallback = { [weak self] progress in
-                let cleanText = progress.text
-                    .replacingOccurrences(of: "<|[^>]+\\|>", with: "", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                Task { @MainActor [weak self] in
-                    guard let self, !cleanText.isEmpty else { return }
-                    let preview = self.mergeTranscriptions(existing: self.accumulatedTranscription, new: cleanText)
-                    self.launcherPanel?.updateLiveText(preview)
-                }
-                return true
-            }
-
-            let results = try await whisperKit.transcribe(audioArray: resampled, decodeOptions: options, callback: callback)
+            let results = try await whisperKit.transcribe(audioArray: resampled, decodeOptions: options)
             let chunkText = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
 
             let finalText = mergeTranscriptions(existing: accumulatedTranscription, new: chunkText)
             accumulatedTranscription = ""
-            appLogger.info("Transcription: \(finalText.prefix(100))...")
 
             if finalText.isEmpty {
                 showNotification(title: "Whisper", message: "No speech detected. Try again.")
@@ -537,7 +488,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 copyAndPaste(finalText)
             }
         } catch {
-            appLogger.error("Transcription failed: \(error.localizedDescription)")
             showNotification(title: "Whisper", message: "Transcription failed: \(error.localizedDescription)")
         }
 
@@ -546,33 +496,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restoreWindow(item: TranscriptionQueueItem) {
-        logFocusDebug("=== Restoring Window ===")
+        guard let window = item.savedWindow else { return }
+        guard let app = NSRunningApplication(processIdentifier: item.savedAppPid) else { return }
 
-        guard let window = item.savedWindow else {
-            logFocusDebug("No saved window")
-            return
-        }
-
-        logFocusDebug("Restoring window id: \(item.savedWindowId) pid: \(item.savedAppPid) title: \(item.savedWindowTitle)")
-
-        guard let app = NSRunningApplication(processIdentifier: item.savedAppPid) else {
-            logFocusDebug("Could not find app")
-            return
-        }
-
-        let activated = app.activate()
-        logFocusDebug("App activate result: \(activated)")
-
-        let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        logFocusDebug("Raise result: \(raiseResult.rawValue)")
+        app.activate()
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
     private func saveTranscript(_ text: String) {
-        if let path = transcriptionStore.save(text) {
-            appLogger.info("Saved transcript to \(path.path)")
-        }
+        transcriptionStore.save(text)
         recentTranscriptions.insert(TranscriptionRecord(timestamp: "", text: text), at: 0)
         updateRecentMenu()
     }
@@ -601,7 +535,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vUp?.flags = .maskCommand
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
-        appLogger.info("Paste sent")
 
         if autoSend {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -612,7 +545,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 enterUp?.flags = []
                 enterDown?.post(tap: .cghidEventTap)
                 enterUp?.post(tap: .cghidEventTap)
-                appLogger.info("Enter sent")
             }
         }
     }
@@ -1276,6 +1208,7 @@ final class LauncherPanel {
 
     func showRecording() {
         stopAnimation()
+        hideLiveText()
         glassButton.isHidden = true
         label.isHidden = true
         statsCard.isHidden = true

@@ -237,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let modelFolder = appSupport.appendingPathComponent("Models", isDirectory: true)
             try? FileManager.default.createDirectory(at: modelFolder, withIntermediateDirectories: true)
 
-            launcherPanel?.updateLoadingProgress(0, status: "Downloading model...")
+            launcherPanel?.updateLoadingProgress(0)
 
             let modelPath = try await WhisperKit.download(
                 variant: "large-v3",
@@ -245,13 +245,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 useBackgroundSession: false
             ) { progress in
                 Task { @MainActor [weak self] in
-                    self?.launcherPanel?.updateLoadingProgress(progress.fractionCompleted, status: "Downloading... \(Int(progress.fractionCompleted * 100))%")
+                    self?.launcherPanel?.updateLoadingProgress(progress.fractionCompleted)
                 }
             }
 
-            launcherPanel?.updateLoadingProgress(1.0, status: "Loading model...")
+            launcherPanel?.updateLoadingProgress(1.0)
             whisperKit = try await WhisperKit(modelFolder: modelPath.path)
-            launcherPanel?.updateLoadingProgress(1.0, status: "Ready!")
             updateIcon(.ready)
             launcherPanel?.hideLoading()
         } catch {
@@ -873,7 +872,6 @@ final class LauncherPanel {
     private var liveTextBubble: NSVisualEffectView?
     private var liveTextLabel: NSTextField?
     private var progressBar: NSProgressIndicator?
-    private var progressLabel: NSTextField?
 
     init(onRecord: @escaping () -> Void) {
         self.onRecord = onRecord
@@ -1176,16 +1174,17 @@ final class LauncherPanel {
         label.isHidden = true
         updateGearIcon()
 
-        let progressWidth: CGFloat = 160
-        let totalWidth = max(padding + iconSize + padding, progressWidth)
-        let totalHeight = buttonHeight + 30
+        let progressWidth: CGFloat = 120
+        let buttonW = padding + iconSize + padding
+        let totalWidth = max(buttonW, progressWidth)
+        let totalHeight = buttonHeight + 16
 
         window.setContentSize(NSSize(width: totalWidth, height: totalHeight))
         container.frame = NSRect(x: 0, y: 0, width: totalWidth, height: totalHeight)
-        glassButton.frame = NSRect(x: (totalWidth - (padding + iconSize + padding)) / 2, y: 30, width: padding + iconSize + padding, height: buttonHeight)
-        clickButton.frame = NSRect(x: 0, y: 0, width: padding + iconSize + padding, height: buttonHeight)
+        glassButton.frame = NSRect(x: (totalWidth - buttonW) / 2, y: 16, width: buttonW, height: buttonHeight)
+        clickButton.frame = NSRect(x: 0, y: 0, width: buttonW, height: buttonHeight)
 
-        let bar = NSProgressIndicator(frame: NSRect(x: (totalWidth - progressWidth) / 2, y: 12, width: progressWidth, height: 4))
+        let bar = NSProgressIndicator(frame: NSRect(x: (totalWidth - progressWidth) / 2, y: 4, width: progressWidth, height: 4))
         bar.style = .bar
         bar.isIndeterminate = false
         bar.minValue = 0
@@ -1193,14 +1192,6 @@ final class LauncherPanel {
         bar.doubleValue = 0
         container.addSubview(bar)
         progressBar = bar
-
-        let lbl = NSTextField(labelWithString: "Loading model...")
-        lbl.font = NSFont.systemFont(ofSize: 10, weight: .regular)
-        lbl.textColor = .secondaryLabelColor
-        lbl.alignment = .center
-        lbl.frame = NSRect(x: 0, y: 0, width: totalWidth, height: 12)
-        container.addSubview(lbl)
-        progressLabel = lbl
 
         show()
         animationTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -1212,17 +1203,14 @@ final class LauncherPanel {
         }
     }
 
-    func updateLoadingProgress(_ progress: Double, status: String) {
+    func updateLoadingProgress(_ progress: Double) {
         progressBar?.doubleValue = progress
-        progressLabel?.stringValue = status
     }
 
     func hideLoading() {
         stopAnimation()
         progressBar?.removeFromSuperview()
         progressBar = nil
-        progressLabel?.removeFromSuperview()
-        progressLabel = nil
         hide()
     }
 

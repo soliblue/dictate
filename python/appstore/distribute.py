@@ -38,16 +38,16 @@ def check_requirements():
     return True
 
 
-def generate_screenshots(model: str = "fast", all_sizes: bool = False):
+def generate_screenshots(all_sizes: bool = False, regenerate_prompts: bool = False):
     print("\n" + "=" * 60)
-    print("🖼️  GENERATING SCREENSHOTS")
+    print("🖼️  GENERATING SCREENSHOTS (Nano Banana Pro)")
     print("=" * 60)
 
     from screenshots import generate_all_screenshots
-    from config import MACOS_SCREENSHOT_SIZES, SCREENSHOT_SCENES
+    from config import MACOS_SCREENSHOT_SIZES
 
     sizes = MACOS_SCREENSHOT_SIZES if all_sizes else [MACOS_SCREENSHOT_SIZES[0]]
-    generated = generate_all_screenshots(model=model, sizes=sizes)
+    generated = generate_all_screenshots(sizes=sizes, regenerate_prompts=regenerate_prompts)
 
     print(f"\n✅ Generated {len(generated)} screenshots")
     return generated
@@ -231,7 +231,7 @@ def full_distribution(skip_build: bool = False, skip_upload: bool = False):
     if not check_requirements():
         return False
 
-    generate_screenshots(model="fast", all_sizes=False)
+    generate_screenshots(all_sizes=False)
     generate_descriptions()
     generate_metadata()
 
@@ -283,8 +283,8 @@ Environment variables:
 
     parser.add_argument("--check", action="store_true", help="Check requirements only")
     parser.add_argument("--screenshots", action="store_true", help="Generate screenshots")
-    parser.add_argument("--screenshots-model", choices=["fast", "pro"], default="fast")
-    parser.add_argument("--screenshots-all-sizes", action="store_true")
+    parser.add_argument("--screenshots-all-sizes", action="store_true", help="Generate all screenshot sizes")
+    parser.add_argument("--regenerate-prompts", action="store_true", help="Force regenerate LLM prompts")
     parser.add_argument("--descriptions", action="store_true", help="Generate descriptions")
     parser.add_argument("--descriptions-lang", type=str, nargs="+", help="Languages to generate")
     parser.add_argument("--metadata", action="store_true", help="Generate metadata")
@@ -300,7 +300,7 @@ Environment variables:
         sys.exit(0 if check_requirements() else 1)
 
     if args.screenshots:
-        generate_screenshots(model=args.screenshots_model, all_sizes=args.screenshots_all_sizes)
+        generate_screenshots(all_sizes=args.screenshots_all_sizes, regenerate_prompts=args.regenerate_prompts)
 
     if args.descriptions:
         generate_descriptions(languages=args.descriptions_lang)

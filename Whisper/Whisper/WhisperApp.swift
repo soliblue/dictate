@@ -1397,6 +1397,9 @@ final class LauncherPanel {
         liveTextLabel?.stringValue = text
         liveTextLabel?.preferredMaxLayoutWidth = textWidth
 
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
         let textSize = liveTextLabel?.sizeThatFits(NSSize(width: textWidth, height: CGFloat.greatestFiniteMagnitude)) ?? NSSize(width: textWidth, height: 20)
         let bubbleHeight = max(50, textSize.height + textPadding * 2)
 
@@ -1420,6 +1423,8 @@ final class LauncherPanel {
             let x = (screen.frame.width - totalWidth) / 2
             window.setFrameOrigin(NSPoint(x: x, y: window.frame.origin.y))
         }
+
+        CATransaction.commit()
     }
 
     func hideLiveText() {
@@ -1483,7 +1488,7 @@ final class LauncherPanel {
         window.setFrameOrigin(NSPoint(x: x, y: y))
 
         window.alphaValue = 0
-        window.makeKeyAndOrderFront(nil)
+        window.orderFront(nil)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.15
             window.animator().alphaValue = 1

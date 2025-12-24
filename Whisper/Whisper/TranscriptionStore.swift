@@ -9,10 +9,14 @@ final class TranscriptionStore {
     let directory: URL
     private let fileManager: FileManager
 
-    init(directory: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dictate_transcripts", isDirectory: true),
-         fileManager: FileManager = .default) {
-        self.directory = directory
+    init(directory: URL? = nil, fileManager: FileManager = .default) {
         self.fileManager = fileManager
+        if let dir = directory {
+            self.directory = dir
+        } else {
+            let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            self.directory = appSupport.appendingPathComponent("Transcripts", isDirectory: true)
+        }
     }
 
     func save(_ text: String, timestamp: Date = Date()) -> URL? {

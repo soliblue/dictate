@@ -9,7 +9,6 @@ import UserNotifications
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 let minRecordSeconds = 0.3
-let transcriptsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dictate_transcripts", isDirectory: true)
 
 let supportedLanguages: [(code: String?, name: String)] = [
     (nil, "Auto-detect"),

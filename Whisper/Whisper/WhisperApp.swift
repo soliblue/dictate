@@ -237,9 +237,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let modelFolder = appSupport.appendingPathComponent("Models", isDirectory: true)
             try? FileManager.default.createDirectory(at: modelFolder, withIntermediateDirectories: true)
 
-            launcherPanel?.updateLoadingStatus("Downloading model...")
-            whisperKit = try await WhisperKit(model: "large-v3", downloadBase: modelFolder)
-            launcherPanel?.updateLoadingStatus("Ready!")
+            launcherPanel?.updateLoadingProgress(0, status: "Downloading model...")
+
+            let modelPath = try await WhisperKit.download(
+                variant: "large-v3",
+                downloadBase: modelFolder,
+                useBackgroundSession: false
+            ) { progress in
+                Task { @MainActor [weak self] in
+                    self?.launcherPanel?.updateLoadingProgress(progress.fractionCompleted, status: "Downloading... \(Int(progress.fractionCompleted * 100))%")
+                }
+            }
+
+            launcherPanel?.updateLoadingProgress(1.0, status: "Loading model...")
+            whisperKit = try await WhisperKit(modelFolder: modelPath.path)
+            launcherPanel?.updateLoadingProgress(1.0, status: "Ready!")
             updateIcon(.ready)
             launcherPanel?.hideLoading()
         } catch {
@@ -1175,9 +1187,11 @@ final class LauncherPanel {
 
         let bar = NSProgressIndicator(frame: NSRect(x: (totalWidth - progressWidth) / 2, y: 12, width: progressWidth, height: 4))
         bar.style = .bar
-        bar.isIndeterminate = true
+        bar.isIndeterminate = false
+        bar.minValue = 0
+        bar.maxValue = 1
+        bar.doubleValue = 0
         container.addSubview(bar)
-        bar.startAnimation(nil)
         progressBar = bar
 
         let lbl = NSTextField(labelWithString: "Loading model...")
@@ -1198,7 +1212,8 @@ final class LauncherPanel {
         }
     }
 
-    func updateLoadingStatus(_ status: String) {
+    func updateLoadingProgress(_ progress: Double, status: String) {
+        progressBar?.doubleValue = progress
         progressLabel?.stringValue = status
     }
 

@@ -236,7 +236,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             let modelFolder = appSupport.appendingPathComponent("Models", isDirectory: true)
             try? FileManager.default.createDirectory(at: modelFolder, withIntermediateDirectories: true)
+
+            launcherPanel?.updateLoadingStatus("Downloading model...")
             whisperKit = try await WhisperKit(model: "large-v3", downloadBase: modelFolder)
+            launcherPanel?.updateLoadingStatus("Ready!")
             updateIcon(.ready)
             launcherPanel?.hideLoading()
         } catch {
@@ -857,6 +860,8 @@ final class LauncherPanel {
     private var queueCount: Int = 0
     private var liveTextBubble: NSVisualEffectView?
     private var liveTextLabel: NSTextField?
+    private var progressBar: NSProgressIndicator?
+    private var progressLabel: NSTextField?
 
     init(onRecord: @escaping () -> Void) {
         self.onRecord = onRecord
@@ -1158,7 +1163,31 @@ final class LauncherPanel {
         statsCard.isHidden = true
         label.isHidden = true
         updateGearIcon()
-        resizeWindowIconOnly()
+
+        let progressWidth: CGFloat = 160
+        let totalWidth = max(padding + iconSize + padding, progressWidth)
+        let totalHeight = buttonHeight + 30
+
+        window.setContentSize(NSSize(width: totalWidth, height: totalHeight))
+        container.frame = NSRect(x: 0, y: 0, width: totalWidth, height: totalHeight)
+        glassButton.frame = NSRect(x: (totalWidth - (padding + iconSize + padding)) / 2, y: 30, width: padding + iconSize + padding, height: buttonHeight)
+        clickButton.frame = NSRect(x: 0, y: 0, width: padding + iconSize + padding, height: buttonHeight)
+
+        let bar = NSProgressIndicator(frame: NSRect(x: (totalWidth - progressWidth) / 2, y: 12, width: progressWidth, height: 4))
+        bar.style = .bar
+        bar.isIndeterminate = true
+        container.addSubview(bar)
+        bar.startAnimation(nil)
+        progressBar = bar
+
+        let lbl = NSTextField(labelWithString: "Loading model...")
+        lbl.font = NSFont.systemFont(ofSize: 10, weight: .regular)
+        lbl.textColor = .secondaryLabelColor
+        lbl.alignment = .center
+        lbl.frame = NSRect(x: 0, y: 0, width: totalWidth, height: 12)
+        container.addSubview(lbl)
+        progressLabel = lbl
+
         show()
         animationTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -1169,8 +1198,16 @@ final class LauncherPanel {
         }
     }
 
+    func updateLoadingStatus(_ status: String) {
+        progressLabel?.stringValue = status
+    }
+
     func hideLoading() {
         stopAnimation()
+        progressBar?.removeFromSuperview()
+        progressBar = nil
+        progressLabel?.removeFromSuperview()
+        progressLabel = nil
         hide()
     }
 

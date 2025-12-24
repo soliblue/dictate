@@ -77,6 +77,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var iconAnimationTimer: Timer?
     private var iconAnimationFrame: Int = 0
     private var transcriptionQueue: [TranscriptionQueueItem] = []
+    private var chunkTimer: Timer?
+    private var lastChunkEndSample: Int = 0
+    private var accumulatedTranscription: String = ""
+    private var isChunkTranscribing = false
+    private let chunkDurationSeconds: Double = 5.0
+    private let overlapDurationSeconds: Double = 1.5
     private var selectedLanguage: String? {
         get { UserDefaults.standard.string(forKey: "selectedLanguage") }
         set {
@@ -90,7 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private var languageMenu: NSMenu?
     private var recentMenu: NSMenu?
-    private var recentTranscriptions: [(timestamp: String, text: String)] = []
+    private var recentTranscriptions: [TranscriptionRecord] = []
+    private let transcriptionStore = TranscriptionStore()
     private var autoSendMenuItem: NSMenuItem?
     private var autoSend: Bool {
         get { UserDefaults.standard.bool(forKey: "autoSend") }
@@ -186,25 +193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func totalTranscriptionCount() -> Int {
-        guard FileManager.default.fileExists(atPath: transcriptsDir.path) else { return 0 }
-        return ((try? FileManager.default.contentsOfDirectory(at: transcriptsDir, includingPropertiesForKeys: nil))?.filter { $0.pathExtension == "txt" }.count) ?? 0
+        transcriptionStore.count()
     }
 
     private func loadRecentTranscriptions() {
-        recentTranscriptions = []
-        guard FileManager.default.fileExists(atPath: transcriptsDir.path) else {
-            updateRecentMenu()
-            return
-        }
-        let files = (try? FileManager.default.contentsOfDirectory(at: transcriptsDir, includingPropertiesForKeys: [.contentModificationDateKey]))?.filter { $0.pathExtension == "txt" }.sorted { a, b in
-            let dateA = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
-            let dateB = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date.distantPast
-            return dateA > dateB
-        } ?? []
-        recentTranscriptions = files.compactMap { file in
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
-            return (file.deletingPathExtension().lastPathComponent, text)
-        }
+        recentTranscriptions = transcriptionStore.loadAll()
         updateRecentMenu()
     }
 
@@ -214,12 +207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             recentMenu?.addItem(NSMenuItem(title: "No transcriptions yet", action: nil, keyEquivalent: ""))
             return
         }
-        for (_, text) in recentTranscriptions {
-            var preview = text.replacingOccurrences(of: "\n", with: " ")
+        for record in recentTranscriptions.prefix(5) {
+            var preview = record.text.replacingOccurrences(of: "\n", with: " ")
             if preview.count > 50 { preview = String(preview.prefix(50)) + "..." }
             let item = NSMenuItem(title: preview, action: #selector(copyTranscription(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = text
+            item.representedObject = record.text
             recentMenu?.addItem(item)
         }
     }
@@ -276,11 +269,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logFocusInfo()
         recorder.start()
         isRecording = true
+        lastChunkEndSample = 0
+        accumulatedTranscription = ""
+        isChunkTranscribing = false
         updateIcon(.recording)
         statusItem.menu?.item(at: 0)?.title = "Stop Recording"
         screenGlow?.show(mode: .recording)
         launcherPanel?.showRecording()
         appLogger.info("Recording started")
+        startChunkTimer()
+    }
+
+    private func startChunkTimer() {
+        chunkTimer?.invalidate()
+        chunkTimer = Timer.scheduledTimer(withTimeInterval: chunkDurationSeconds, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.transcribeCurrentChunk()
+            }
+        }
+    }
+
+    private func transcribeCurrentChunk() {
+        guard isRecording, !isChunkTranscribing, let whisperKit else { return }
+
+        let sampleRate = recorder.sampleRate
+        let chunkSamples = Int(chunkDurationSeconds * sampleRate)
+        let overlapSamples = Int(overlapDurationSeconds * sampleRate)
+        let currentSampleCount = recorder.sampleCount()
+
+        guard currentSampleCount >= chunkSamples else { return }
+
+        let startSample = max(0, lastChunkEndSample - overlapSamples)
+        let samples = recorder.currentSamples()
+        guard startSample < samples.count else { return }
+
+        let chunkToTranscribe = Array(samples[startSample...])
+        lastChunkEndSample = samples.count
+
+        isChunkTranscribing = true
+        Task {
+            do {
+                let resampled = AudioProcessor.resampleTo16kHz(samples: chunkToTranscribe, fromRate: sampleRate)
+                let options = DecodingOptions(language: selectedLanguage)
+                let results = try await whisperKit.transcribe(audioArray: resampled, decodeOptions: options)
+                let chunkText = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+
+                await MainActor.run {
+                    if !chunkText.isEmpty {
+                        accumulatedTranscription = mergeTranscriptions(existing: accumulatedTranscription, new: chunkText)
+                        launcherPanel?.updateLiveText(accumulatedTranscription)
+                    }
+                    isChunkTranscribing = false
+                }
+            } catch {
+                await MainActor.run {
+                    isChunkTranscribing = false
+                }
+            }
+        }
+    }
+
+    private func mergeTranscriptions(existing: String, new: String) -> String {
+        guard !existing.isEmpty else { return new }
+        guard !new.isEmpty else { return existing }
+
+        let existingWords = existing.split(separator: " ").map(String.init)
+        let newWords = new.split(separator: " ").map(String.init)
+
+        var overlapStart = -1
+        for i in 0..<min(existingWords.count, 5) {
+            let existingEnd = existingWords.suffix(existingWords.count - i)
+            for j in 0..<min(newWords.count, existingEnd.count) {
+                if Array(existingEnd.prefix(j + 1)) == Array(newWords.prefix(j + 1)) {
+                    overlapStart = i
+                    break
+                }
+            }
+            if overlapStart >= 0 { break }
+        }
+
+        if overlapStart >= 0 {
+            let existingPart = existingWords.prefix(overlapStart).joined(separator: " ")
+            return existingPart.isEmpty ? new : existingPart + " " + new
+        }
+
+        return existing + " " + new
     }
 
     private var savedWindow: AXUIElement?
@@ -346,14 +419,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func stopRecording() {
-        let samples = recorder.stop()
+        chunkTimer?.invalidate()
+        chunkTimer = nil
+
+        let allSamples = recorder.stop()
         let sampleRate = recorder.sampleRate
         isRecording = false
         statusItem.menu?.item(at: 0)?.title = "Start Recording"
-        appLogger.info("Recording stopped, samples: \(samples.count)")
+        appLogger.info("Recording stopped, samples: \(allSamples.count)")
 
-        guard !samples.isEmpty else {
+        guard !allSamples.isEmpty else {
             appLogger.info("No audio captured")
+            accumulatedTranscription = ""
             if !isTranscribing {
                 screenGlow?.hide()
                 launcherPanel?.resetToIdle()
@@ -362,11 +439,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let duration = Double(samples.count) / sampleRate
+        let duration = Double(allSamples.count) / sampleRate
         appLogger.info("Audio duration: \(String(format: "%.2f", duration))s")
 
         if duration < minRecordSeconds {
             appLogger.info("Audio too short")
+            accumulatedTranscription = ""
             if !isTranscribing {
                 screenGlow?.hide()
                 launcherPanel?.resetToIdle()
@@ -376,8 +454,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let overlapSamples = Int(overlapDurationSeconds * sampleRate)
+        let startSample = max(0, lastChunkEndSample - overlapSamples)
+        let remainingSamples = startSample < allSamples.count ? Array(allSamples[startSample...]) : []
+        appLogger.info("Remaining samples to transcribe: \(remainingSamples.count) (from \(startSample))")
+
         let queueItem = TranscriptionQueueItem(
-            samples: samples,
+            samples: remainingSamples.isEmpty ? allSamples : remainingSamples,
             sampleRate: sampleRate,
             savedWindow: savedWindow,
             savedAppPid: savedAppPid,
@@ -424,19 +507,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            let resampled = resampleTo16kHz(samples: item.samples, fromRate: item.sampleRate)
+            let resampled = AudioProcessor.resampleTo16kHz(samples: item.samples, fromRate: item.sampleRate)
             let options = DecodingOptions(language: selectedLanguage)
-            let results = try await whisperKit.transcribe(audioArray: resampled, decodeOptions: options)
-            let text = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
 
-            appLogger.info("Transcription: \(text.prefix(100))...")
+            let callback: TranscriptionCallback = { [weak self] progress in
+                let cleanText = progress.text
+                    .replacingOccurrences(of: "<|[^>]+\\|>", with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                Task { @MainActor [weak self] in
+                    guard let self, !cleanText.isEmpty else { return }
+                    let preview = self.mergeTranscriptions(existing: self.accumulatedTranscription, new: cleanText)
+                    self.launcherPanel?.updateLiveText(preview)
+                }
+                return true
+            }
 
-            if text.isEmpty {
+            let results = try await whisperKit.transcribe(audioArray: resampled, decodeOptions: options, callback: callback)
+            let chunkText = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let finalText = mergeTranscriptions(existing: accumulatedTranscription, new: chunkText)
+            accumulatedTranscription = ""
+            appLogger.info("Transcription: \(finalText.prefix(100))...")
+
+            if finalText.isEmpty {
                 showNotification(title: "Whisper", message: "No speech detected. Try again.")
             } else {
-                saveTranscript(text)
+                saveTranscript(finalText)
                 restoreWindow(item: item)
-                copyAndPaste(text)
+                copyAndPaste(finalText)
             }
         } catch {
             appLogger.error("Transcription failed: \(error.localizedDescription)")
@@ -462,7 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let activated = app.activate(options: [.activateIgnoringOtherApps])
+        let activated = app.activate()
         logFocusDebug("App activate result: \(activated)")
 
         let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
@@ -471,29 +569,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
-    private func resampleTo16kHz(samples: [Float], fromRate: Double) -> [Float] {
-        guard fromRate != 16000 else { return samples }
-        let ratio = 16000.0 / fromRate
-        let newCount = Int(Double(samples.count) * ratio)
-        return (0..<newCount).map { i in
-            let srcIndex = Double(i) / ratio
-            let lower = Int(srcIndex)
-            let upper = min(lower + 1, samples.count - 1)
-            let fraction = Float(srcIndex - Double(lower))
-            return samples[lower] * (1 - fraction) + samples[upper] * fraction
-        }
-    }
-
     private func saveTranscript(_ text: String) {
-        try? FileManager.default.createDirectory(at: transcriptsDir, withIntermediateDirectories: true)
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let timestamp = formatter.string(from: Date())
-        let path = transcriptsDir.appendingPathComponent("\(timestamp).txt")
-        try? text.write(to: path, atomically: true, encoding: .utf8)
-        appLogger.info("Saved transcript to \(path.path)")
-        recentTranscriptions.insert((timestamp, text), at: 0)
-        if recentTranscriptions.count > 5 { recentTranscriptions = Array(recentTranscriptions.prefix(5)) }
+        if let path = transcriptionStore.save(text) {
+            appLogger.info("Saved transcript to \(path.path)")
+        }
+        recentTranscriptions.insert(TranscriptionRecord(timestamp: "", text: text), at: 0)
         updateRecentMenu()
     }
 
@@ -569,9 +649,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func animateLoading() {
         updateLoadingFrame()
         iconAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.iconAnimationFrame += 1
-                self?.updateLoadingFrame()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.iconAnimationFrame += 1
+                self.updateLoadingFrame()
             }
         }
     }
@@ -579,13 +660,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateLoadingFrame() {
         guard let baseImage = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil) else { return }
         let angle = CGFloat(iconAnimationFrame * 30)
-        let size = NSSize(width: 18, height: 18)
-        let rotated = NSImage(size: size, flipped: false) { rect in
+        let gearSize: CGFloat = 14
+        let canvasSize = NSSize(width: 18, height: 18)
+        let rotated = NSImage(size: canvasSize, flipped: false) { _ in
             let context = NSGraphicsContext.current?.cgContext
-            context?.translateBy(x: size.width / 2, y: size.height / 2)
+            context?.translateBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
             context?.rotate(by: angle * .pi / 180)
-            context?.translateBy(x: -size.width / 2, y: -size.height / 2)
-            baseImage.draw(in: rect)
+            let gearRect = NSRect(x: -gearSize / 2, y: -gearSize / 2, width: gearSize, height: gearSize)
+            baseImage.draw(in: gearRect)
             return true
         }
         rotated.isTemplate = true
@@ -595,9 +677,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func animateRecording() {
         updateRecordingFrame()
         iconAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.iconAnimationFrame += 1
-                self?.updateRecordingFrame()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.iconAnimationFrame += 1
+                self.updateRecordingFrame()
             }
         }
     }
@@ -611,9 +694,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func animateTranscribing() {
         updateTranscribingFrame()
         iconAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.iconAnimationFrame += 1
-                self?.updateTranscribingFrame()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.iconAnimationFrame += 1
+                self.updateTranscribingFrame()
             }
         }
     }
@@ -665,6 +749,20 @@ final class AudioRecorder: @unchecked Sendable {
         lock.unlock()
         return result
     }
+
+    func currentSamples() -> [Float] {
+        lock.lock()
+        let result = samples
+        lock.unlock()
+        return result
+    }
+
+    func sampleCount() -> Int {
+        lock.lock()
+        let count = samples.count
+        lock.unlock()
+        return count
+    }
 }
 
 @MainActor
@@ -712,7 +810,9 @@ final class ScreenGlow {
             context.duration = 0.15
             window?.animator().alphaValue = 0
         }) { [weak self] in
-            self?.window?.orderOut(nil)
+            Task { @MainActor [weak self] in
+                self?.window?.orderOut(nil)
+            }
         }
     }
 
@@ -762,7 +862,7 @@ final class ScreenGlow {
         func startPulsing() {
             layer?.opacity = 0.7
             pulseTimer = Timer.scheduledTimer(withTimeInterval: 2.4, repeats: true) { [weak self] _ in
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     guard let self, let layer = self.layer else { return }
                     let animation = CABasicAnimation(keyPath: "opacity")
                     animation.fromValue = 0.7
@@ -820,6 +920,8 @@ final class LauncherPanel {
     private var queueCircles: [NSVisualEffectView] = []
     private var queueIcons: [NSImageView] = []
     private var queueCount: Int = 0
+    private var liveTextBubble: NSVisualEffectView?
+    private var liveTextLabel: NSTextField?
 
     init(onRecord: @escaping () -> Void) {
         self.onRecord = onRecord
@@ -851,12 +953,13 @@ final class LauncherPanel {
         container = NSView(frame: NSRect(x: 0, y: 0, width: buttonWidth, height: totalHeight))
 
         glassButton = NSVisualEffectView(frame: NSRect(x: 0, y: cardHeight + dividerGap, width: buttonWidth, height: buttonHeight))
-        glassButton.material = .fullScreenUI
+        glassButton.material = .hudWindow
         glassButton.state = .active
         glassButton.blendingMode = .behindWindow
         glassButton.wantsLayer = true
         glassButton.layer?.cornerRadius = cornerRadius
         glassButton.layer?.masksToBounds = true
+        glassButton.alphaValue = 0.6
 
         micIcon = NSImageView(frame: NSRect(x: padding, y: (buttonHeight - iconSize) / 2, width: iconSize, height: iconSize))
         micIcon.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
@@ -894,12 +997,13 @@ final class LauncherPanel {
         statsDescLabel.alignment = .center
 
         statsCard = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: buttonWidth, height: cardHeight))
-        statsCard.material = .fullScreenUI
+        statsCard.material = .hudWindow
         statsCard.state = .active
         statsCard.blendingMode = .behindWindow
         statsCard.wantsLayer = true
         statsCard.layer?.cornerRadius = 16
         statsCard.layer?.masksToBounds = true
+        statsCard.alphaValue = 0.6
         statsCard.isHidden = true
 
         statsNumberLabel.frame = NSRect(x: 0, y: cardHeight - 50, width: buttonWidth, height: 40)
@@ -960,7 +1064,9 @@ final class LauncherPanel {
             glassButton.animator().frame = NSRect(x: (expandedCardWidth - glassButton.frame.width) / 2, y: newCardHeight + dividerGap, width: glassButton.frame.width, height: buttonHeight)
             statsCard.animator().frame = NSRect(x: 0, y: 0, width: expandedCardWidth, height: newCardHeight)
         } completionHandler: { [weak self] in
-            self?.createTranscriptionItems()
+            Task { @MainActor [weak self] in
+                self?.createTranscriptionItems()
+            }
         }
     }
 
@@ -980,13 +1086,15 @@ final class LauncherPanel {
             glassButton.animator().frame = NSRect(x: 0, y: cardHeight + dividerGap, width: buttonWidth, height: buttonHeight)
             statsCard.animator().frame = NSRect(x: 0, y: 0, width: buttonWidth, height: cardHeight)
         } completionHandler: { [weak self] in
-            guard let self else { return }
-            self.statsNumberLabel.isHidden = false
-            self.statsDescLabel.isHidden = false
-            self.statsClickButton.isHidden = false
-            self.statsNumberLabel.frame = NSRect(x: 0, y: self.cardHeight - 50, width: self.statsCard.frame.width, height: 40)
-            self.statsDescLabel.frame = NSRect(x: 0, y: 14, width: self.statsCard.frame.width, height: 16)
-            self.statsClickButton.frame = NSRect(x: 0, y: 0, width: self.statsCard.frame.width, height: self.cardHeight)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.statsNumberLabel.isHidden = false
+                self.statsDescLabel.isHidden = false
+                self.statsClickButton.isHidden = false
+                self.statsNumberLabel.frame = NSRect(x: 0, y: self.cardHeight - 50, width: self.statsCard.frame.width, height: 40)
+                self.statsDescLabel.frame = NSRect(x: 0, y: 14, width: self.statsCard.frame.width, height: 16)
+                self.statsClickButton.frame = NSRect(x: 0, y: 0, width: self.statsCard.frame.width, height: self.cardHeight)
+            }
         }
     }
 
@@ -1113,16 +1221,14 @@ final class LauncherPanel {
     func showLoading() {
         stopAnimation()
         statsCard.isHidden = true
-        label.isHidden = false
-        label.stringValue = "loading model"
-        label.sizeToFit()
-        resizeWindow(showStats: false)
+        label.isHidden = true
         updateGearIcon()
+        resizeWindowIconOnly()
         show()
         animationTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.rotationAngle += 6
+                self.rotationAngle -= 6
                 self.updateGearIcon()
             }
         }
@@ -1147,12 +1253,13 @@ final class LauncherPanel {
 
     private func updateGearIcon() {
         guard let baseImage = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil) else { return }
-        let size = NSSize(width: iconSize, height: iconSize)
-        let rotated = NSImage(size: size, flipped: false) { rect in
-            NSGraphicsContext.current?.cgContext.translateBy(x: size.width / 2, y: size.height / 2)
+        let gearSize: CGFloat = 14
+        let canvasSize = NSSize(width: iconSize, height: iconSize)
+        let rotated = NSImage(size: canvasSize, flipped: false) { _ in
+            NSGraphicsContext.current?.cgContext.translateBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
             NSGraphicsContext.current?.cgContext.rotate(by: self.rotationAngle * .pi / 180)
-            NSGraphicsContext.current?.cgContext.translateBy(x: -size.width / 2, y: -size.height / 2)
-            baseImage.draw(in: rect)
+            let gearRect = NSRect(x: -gearSize / 2, y: -gearSize / 2, width: gearSize, height: gearSize)
+            baseImage.draw(in: gearRect)
             return true
         }
         rotated.isTemplate = true
@@ -1179,6 +1286,7 @@ final class LauncherPanel {
 
     func showTranscribing() {
         stopAnimation()
+        hideLiveText()
         glassButton.isHidden = true
         label.isHidden = true
         statsCard.isHidden = true
@@ -1188,7 +1296,7 @@ final class LauncherPanel {
 
     private func startTranscribeAnimation() {
         animationTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.transcribeFrame += 1
                 self.updateFirstCircleIcon()
@@ -1207,22 +1315,31 @@ final class LauncherPanel {
     private func updateQueueCircles(recording: Bool) {
         clearQueueCircles()
 
-        let totalWidth = CGFloat(queueCount) * circleSize + CGFloat(queueCount - 1) * circleGap
-        let windowWidth = max(totalWidth, circleSize)
-        let totalHeight = circleSize
+        let circlesWidth = CGFloat(queueCount) * circleSize + CGFloat(queueCount - 1) * circleGap
+        let bubbleWidth: CGFloat = 320
+        let bubbleHeight: CGFloat = liveTextBubble?.frame.height ?? 0
+        let bubbleSpace: CGFloat = bubbleHeight > 0 ? bubbleHeight + 8 : 0
+        let windowWidth = max(circlesWidth, circleSize, bubbleHeight > 0 ? bubbleWidth : 0)
+        let totalHeight = circleSize + bubbleSpace
 
         window.setContentSize(NSSize(width: windowWidth, height: totalHeight))
         container.frame = NSRect(x: 0, y: 0, width: windowWidth, height: totalHeight)
 
+        if let bubble = liveTextBubble {
+            bubble.frame.origin = NSPoint(x: (windowWidth - bubbleWidth) / 2, y: 0)
+        }
+
+        let circleY = bubbleSpace
         for i in 0..<queueCount {
-            let x = CGFloat(queueCount - 1 - i) * (circleSize + circleGap)
-            let circle = NSVisualEffectView(frame: NSRect(x: x, y: 0, width: circleSize, height: circleSize))
-            circle.material = .fullScreenUI
+            let x = CGFloat(queueCount - 1 - i) * (circleSize + circleGap) + (windowWidth - circlesWidth) / 2
+            let circle = NSVisualEffectView(frame: NSRect(x: x, y: circleY, width: circleSize, height: circleSize))
+            circle.material = .hudWindow
             circle.state = .active
             circle.blendingMode = .behindWindow
             circle.wantsLayer = true
             circle.layer?.cornerRadius = circleSize / 2
             circle.layer?.masksToBounds = true
+            circle.alphaValue = 0.6
 
             let iconView = NSImageView(frame: NSRect(x: (circleSize - 16) / 2, y: (circleSize - 16) / 2, width: 16, height: 16))
             iconView.imageScaling = .scaleProportionallyUpOrDown
@@ -1248,7 +1365,8 @@ final class LauncherPanel {
 
         if let screen = NSScreen.main {
             let x = (screen.frame.width - windowWidth) / 2
-            window.setFrameOrigin(NSPoint(x: x, y: window.frame.origin.y))
+            let y = screen.frame.height * 0.6
+            window.setFrameOrigin(NSPoint(x: x, y: y))
         }
     }
 
@@ -1262,12 +1380,83 @@ final class LauncherPanel {
         if queueCount > 0 {
             queueCount -= 1
         }
+        hideLiveText()
+    }
+
+    func updateLiveText(_ text: String) {
+        guard !text.isEmpty else { return }
+
+        let bubbleWidth: CGFloat = 320
+        let textPadding: CGFloat = 12
+        let textWidth = bubbleWidth - textPadding * 2
+
+        if liveTextBubble == nil {
+            let bubble = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: bubbleWidth, height: 50))
+            bubble.material = .hudWindow
+            bubble.state = .active
+            bubble.blendingMode = .behindWindow
+            bubble.wantsLayer = true
+            bubble.layer?.cornerRadius = 12
+            bubble.layer?.masksToBounds = true
+            bubble.alphaValue = 0.6
+
+            let textLabel = NSTextField(wrappingLabelWithString: "")
+            textLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+            textLabel.textColor = .labelColor
+            textLabel.backgroundColor = .clear
+            textLabel.isBezeled = false
+            textLabel.isEditable = false
+            textLabel.maximumNumberOfLines = 0
+            textLabel.lineBreakMode = .byWordWrapping
+            textLabel.preferredMaxLayoutWidth = textWidth
+            textLabel.cell?.wraps = true
+
+            bubble.addSubview(textLabel)
+            container.addSubview(bubble)
+
+            liveTextBubble = bubble
+            liveTextLabel = textLabel
+        }
+
+        liveTextLabel?.stringValue = text
+        liveTextLabel?.preferredMaxLayoutWidth = textWidth
+
+        let textSize = liveTextLabel?.sizeThatFits(NSSize(width: textWidth, height: CGFloat.greatestFiniteMagnitude)) ?? NSSize(width: textWidth, height: 20)
+        let bubbleHeight = max(50, textSize.height + textPadding * 2)
+
+        liveTextLabel?.frame = NSRect(x: textPadding, y: textPadding, width: textWidth, height: textSize.height)
+        liveTextBubble?.frame.size.height = bubbleHeight
+
+        let totalWidth = max(bubbleWidth, CGFloat(queueCount) * circleSize + CGFloat(queueCount - 1) * circleGap)
+        let totalHeight = circleSize + 8 + bubbleHeight
+        window.setContentSize(NSSize(width: totalWidth, height: totalHeight))
+        container.frame = NSRect(x: 0, y: 0, width: totalWidth, height: totalHeight)
+
+        let circleY = bubbleHeight + 8
+        for (i, circle) in queueCircles.enumerated() {
+            let x = CGFloat(queueCount - 1 - i) * (circleSize + circleGap) + (totalWidth - CGFloat(queueCount) * circleSize - CGFloat(queueCount - 1) * circleGap) / 2
+            circle.frame.origin = NSPoint(x: x, y: circleY)
+        }
+
+        liveTextBubble?.frame.origin = NSPoint(x: (totalWidth - bubbleWidth) / 2, y: 0)
+
+        if let screen = NSScreen.main {
+            let x = (screen.frame.width - totalWidth) / 2
+            window.setFrameOrigin(NSPoint(x: x, y: window.frame.origin.y))
+        }
+    }
+
+    func hideLiveText() {
+        liveTextBubble?.removeFromSuperview()
+        liveTextBubble = nil
+        liveTextLabel = nil
     }
 
     func resetToIdle() {
         stopAnimation()
         queueCount = 0
         clearQueueCircles()
+        hideLiveText()
         glassButton.isHidden = false
         hide()
     }
@@ -1357,7 +1546,9 @@ final class LauncherPanel {
             context.duration = 0.1
             window.animator().alphaValue = 0
         }) { [weak self] in
-            self?.window.orderOut(nil)
+            Task { @MainActor [weak self] in
+                self?.window.orderOut(nil)
+            }
         }
     }
 }

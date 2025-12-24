@@ -233,7 +233,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func loadWhisperModel() async {
         do {
-            whisperKit = try await WhisperKit(model: "large-v3")
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            let modelFolder = appSupport.appendingPathComponent("Models", isDirectory: true)
+            try? FileManager.default.createDirectory(at: modelFolder, withIntermediateDirectories: true)
+            whisperKit = try await WhisperKit(model: "large-v3", downloadBase: modelFolder)
             updateIcon(.ready)
             launcherPanel?.hideLoading()
         } catch {

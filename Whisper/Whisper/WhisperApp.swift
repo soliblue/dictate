@@ -503,6 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 saveTranscript(finalText)
                 restoreWindow(item: item)
                 copyAndPaste(finalText)
+                launcherPanel?.hideLiveText()
             }
         } catch {
             showNotification(title: "Whisper", message: "Transcription failed: \(error.localizedDescription)")
@@ -1251,7 +1252,6 @@ final class LauncherPanel {
 
     func showRecording() {
         stopAnimation()
-        hideLiveText()
         glassButton.isHidden = true
         label.isHidden = true
         statsCard.isHidden = true

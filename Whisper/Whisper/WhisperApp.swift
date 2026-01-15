@@ -4,6 +4,7 @@ import AVFoundation
 import WhisperKit
 import Quartz
 import UserNotifications
+import UniformTypeIdentifiers
 
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
@@ -53,10 +54,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRecording = false
     private var isTranscribing = false
     private var flagsMonitor: Any?
+    private var keyMonitor: Any?
     private var screenGlow: ScreenGlow?
     private var launcherPanel: LauncherPanel?
     private var statusMenu: NSMenu?
-    private var rightOptionDown = false
+    private var hotkeyDown = false
+    private var keyPressedDuringHotkey = false
+    private var hotkeyMenu: NSMenu?
     private var iconAnimationTimer: Timer?
     private var iconAnimationFrame: Int = 0
     private var transcriptionQueue: [TranscriptionQueueItem] = []
@@ -90,6 +94,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             autoSendMenuItem?.state = newValue ? .on : .off
         }
     }
+    private var fileTranscriptionName: String?
+    private var selectedHotkey: String {
+        get { UserDefaults.standard.string(forKey: "selectedHotkey") ?? "rightOption" }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "selectedHotkey")
+            updateHotkeyMenu()
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -99,11 +111,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         screenGlow = ScreenGlow()
         launcherPanel = LauncherPanel { [weak self] in self?.startRecording() }
         launcherPanel?.showLoading()
+        NotificationCenter.default.addObserver(forName: .transcribeFile, object: nil, queue: .main) { [weak self] notification in
+            guard let url = notification.object as? URL else { return }
+            Task { await self?.transcribeFile(url: url) }
+        }
         Task { await loadWhisperModel() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let monitor = flagsMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            Task { await transcribeFile(url: url) }
+        }
+    }
+
+    private func decodeAudioFile(url: URL) async throws -> (samples: [Float], sampleRate: Double) {
+        let audioFile = try AVAudioFile(forReading: url)
+        let format = audioFile.processingFormat
+        let frameCount = AVAudioFrameCount(audioFile.length)
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+            throw NSError(domain: "Whisper", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to create audio buffer"])
+        }
+
+        try audioFile.read(into: buffer)
+
+        guard let floatData = buffer.floatChannelData else {
+            throw NSError(domain: "Whisper", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to read audio data"])
+        }
+
+        let channelCount = Int(format.channelCount)
+        let frameLength = Int(buffer.frameLength)
+
+        var samples: [Float]
+        if channelCount == 1 {
+            samples = Array(UnsafeBufferPointer(start: floatData[0], count: frameLength))
+        } else {
+            samples = [Float](repeating: 0, count: frameLength)
+            for i in 0..<frameLength {
+                var sum: Float = 0
+                for ch in 0..<channelCount {
+                    sum += floatData[ch][i]
+                }
+                samples[i] = sum / Float(channelCount)
+            }
+        }
+
+        return (samples, format.sampleRate)
+    }
+
+    private func transcribeFile(url: URL) async {
+        guard whisperKit != nil else {
+            showNotification(title: "Whisper", message: "Model not loaded yet. Please wait.")
+            return
+        }
+
+        fileTranscriptionName = url.lastPathComponent
+        screenGlow?.show(mode: .transcribing)
+        launcherPanel?.showFileTranscribing(fileName: fileTranscriptionName!)
+        updateIcon(.transcribing)
+
+        do {
+            let (samples, sampleRate) = try await decodeAudioFile(url: url)
+            let resampled = AudioProcessor.resampleTo16kHz(samples: samples, fromRate: sampleRate)
+            let options = DecodingOptions(language: selectedLanguage)
+            let results = try await whisperKit!.transcribe(audioArray: resampled, decodeOptions: options)
+            let text = results.map { $0.text }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if text.isEmpty {
+                showNotification(title: "Whisper", message: "No speech detected in file.")
+            } else {
+                saveTranscript(text)
+                copyToClipboard(text)
+                launcherPanel?.showFileResult(text: text, fileName: fileTranscriptionName!)
+                showNotification(title: "Whisper", message: "Transcription copied to clipboard!")
+            }
+        } catch {
+            showNotification(title: "Whisper", message: "Failed to transcribe file: \(error.localizedDescription)")
+            launcherPanel?.resetToIdle()
+        }
+
+        fileTranscriptionName = nil
+        screenGlow?.hide()
+        updateIcon(.ready)
     }
 
     private func setupStatusItem() {
@@ -143,6 +237,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoSendMenuItem?.state = autoSend ? .on : .off
         statusMenu?.addItem(autoSendMenuItem!)
 
+        let hotkeyItem = NSMenuItem(title: "Hotkey", action: nil, keyEquivalent: "")
+        hotkeyMenu = NSMenu()
+        let hotkeyOptions: [(id: String, name: String)] = [
+            ("rightOption", "Right Option ⌥"),
+            ("leftOption", "Left Option ⌥"),
+            ("globe", "Globe 🌐")
+        ]
+        for opt in hotkeyOptions {
+            let item = NSMenuItem(title: opt.name, action: #selector(selectHotkey(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = opt.id
+            hotkeyMenu?.addItem(item)
+        }
+        hotkeyItem.submenu = hotkeyMenu
+        statusMenu?.addItem(hotkeyItem)
+        updateHotkeyMenu()
+
         statusMenu?.addItem(NSMenuItem.separator())
         statusMenu?.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusMenu?.items.forEach { $0.target = self }
@@ -163,6 +274,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
         selectedLanguage = sender.representedObject as? String
+    }
+
+    @objc private func selectHotkey(_ sender: NSMenuItem) {
+        selectedHotkey = sender.representedObject as? String ?? "rightOption"
+    }
+
+    private func updateHotkeyMenu() {
+        hotkeyMenu?.items.forEach { item in
+            let id = item.representedObject as? String
+            item.state = (id == selectedHotkey) ? .on : .off
+        }
     }
 
     @objc private func toggleAutoSend() {
@@ -215,19 +337,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleFlagsChanged(event)
             }
         }
+        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] _ in
+            Task { @MainActor in
+                if self?.hotkeyDown == true {
+                    self?.keyPressedDuringHotkey = true
+                }
+            }
+        }
     }
 
     private func handleFlagsChanged(_ event: NSEvent) {
-        let isRightOption = event.keyCode == 61
-        guard isRightOption else { return }
+        let hotkeyKeyCode: UInt16
+        let modifierFlag: NSEvent.ModifierFlags
 
-        let optionPressed = event.modifierFlags.contains(.option)
-        if optionPressed && !rightOptionDown {
-            rightOptionDown = true
+        switch selectedHotkey {
+        case "leftOption":
+            hotkeyKeyCode = 58
+            modifierFlag = .option
+        case "globe":
+            hotkeyKeyCode = 63
+            modifierFlag = .function
+        default:
+            hotkeyKeyCode = 61
+            modifierFlag = .option
+        }
+
+        guard event.keyCode == hotkeyKeyCode else { return }
+
+        let hotkeyPressed = event.modifierFlags.contains(modifierFlag)
+        if hotkeyPressed && !hotkeyDown {
+            hotkeyDown = true
+            keyPressedDuringHotkey = false
             if !isRecording { startRecording() }
-        } else if !optionPressed && rightOptionDown {
-            rightOptionDown = false
-            if isRecording { stopRecording() }
+        } else if !hotkeyPressed && hotkeyDown {
+            hotkeyDown = false
+            if keyPressedDuringHotkey {
+                if isRecording { stopRecording(cancel: true) }
+            } else {
+                if isRecording { stopRecording() }
+            }
+            keyPressedDuringHotkey = false
         }
     }
 
@@ -406,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pb.setString(text, forType: .string)
     }
 
-    private func stopRecording() {
+    private func stopRecording(cancel: Bool = false) {
         chunkTimer?.invalidate()
         chunkTimer = nil
 
@@ -414,6 +563,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sampleRate = recorder.sampleRate
         isRecording = false
         statusItem.menu?.item(at: 0)?.title = "Start Recording"
+
+        if cancel {
+            accumulatedTranscription = ""
+            launcherPanel?.hideLiveText()
+            if !isTranscribing {
+                screenGlow?.hide()
+                launcherPanel?.resetToIdle()
+                updateIcon(.ready)
+            }
+            return
+        }
 
         guard !allSamples.isEmpty else {
             accumulatedTranscription = ""
@@ -434,7 +594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 launcherPanel?.resetToIdle()
                 updateIcon(.ready)
             }
-            showNotification(title: "Whisper", message: "Recording too short. Hold Right Option longer.")
+            showNotification(title: "Whisper", message: "Recording too short. Hold the hotkey longer.")
             return
         }
 
@@ -838,7 +998,7 @@ final class LauncherPanel {
     private let window: NSPanel
     private let onRecord: () -> Void
     private var eventMonitor: Any?
-    private var container: NSView!
+    private var container: DropView!
     private var glassButton: NSVisualEffectView!
     private var micIcon: NSImageView!
     private var label: NSTextField!
@@ -901,7 +1061,7 @@ final class LauncherPanel {
         window.hasShadow = false
         window.hidesOnDeactivate = false
 
-        container = NSView(frame: NSRect(x: 0, y: 0, width: buttonWidth, height: totalHeight))
+        container = DropView(frame: NSRect(x: 0, y: 0, width: buttonWidth, height: totalHeight))
 
         glassButton = NSVisualEffectView(frame: NSRect(x: 0, y: cardHeight + dividerGap, width: buttonWidth, height: buttonHeight))
         glassButton.material = .hudWindow
@@ -1531,5 +1691,146 @@ final class LauncherPanel {
                 self?.window.orderOut(nil)
             }
         }
+    }
+
+    func showFileTranscribing(fileName: String) {
+        stopAnimation()
+        glassButton.isHidden = true
+        statsCard.isHidden = true
+        clearQueueCircles()
+        hideLiveText()
+
+        let bubbleWidth: CGFloat = 320
+        let textPadding: CGFloat = 12
+
+        let bubble = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: bubbleWidth, height: 60))
+        bubble.material = .hudWindow
+        bubble.state = .active
+        bubble.blendingMode = .behindWindow
+        bubble.wantsLayer = true
+        bubble.layer?.cornerRadius = 12
+        bubble.layer?.masksToBounds = true
+        bubble.alphaValue = 0.6
+
+        let iconView = NSImageView(frame: NSRect(x: textPadding, y: 20, width: 20, height: 20))
+        iconView.image = NSImage(systemSymbolName: "doc.fill", accessibilityDescription: nil)
+        iconView.contentTintColor = .secondaryLabelColor
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        bubble.addSubview(iconView)
+
+        var displayName = fileName
+        if displayName.count > 30 { displayName = String(displayName.prefix(27)) + "..." }
+
+        let nameLabel = NSTextField(labelWithString: displayName)
+        nameLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        nameLabel.textColor = .labelColor
+        nameLabel.frame = NSRect(x: textPadding + 28, y: 30, width: bubbleWidth - textPadding * 2 - 28, height: 18)
+        bubble.addSubview(nameLabel)
+
+        let statusLabel = NSTextField(labelWithString: "Transcribing...")
+        statusLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.frame = NSRect(x: textPadding + 28, y: 12, width: bubbleWidth - textPadding * 2 - 28, height: 14)
+        bubble.addSubview(statusLabel)
+
+        container.addSubview(bubble)
+        liveTextBubble = bubble
+
+        window.setContentSize(NSSize(width: bubbleWidth, height: 60))
+        container.frame = NSRect(x: 0, y: 0, width: bubbleWidth, height: 60)
+        bubble.frame.origin = .zero
+
+        show()
+        startTranscribeAnimation()
+    }
+
+    func showFileResult(text: String, fileName: String) {
+        stopAnimation()
+        hideLiveText()
+
+        let bubbleWidth: CGFloat = 320
+        let textPadding: CGFloat = 12
+        let textWidth = bubbleWidth - textPadding * 2
+
+        let bubble = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: bubbleWidth, height: 100))
+        bubble.material = .hudWindow
+        bubble.state = .active
+        bubble.blendingMode = .behindWindow
+        bubble.wantsLayer = true
+        bubble.layer?.cornerRadius = 12
+        bubble.layer?.masksToBounds = true
+        bubble.alphaValue = 0.6
+
+        var displayName = fileName
+        if displayName.count > 35 { displayName = String(displayName.prefix(32)) + "..." }
+
+        let headerLabel = NSTextField(labelWithString: displayName)
+        headerLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        headerLabel.textColor = .secondaryLabelColor
+        headerLabel.frame = NSRect(x: textPadding, y: 0, width: textWidth, height: 14)
+        bubble.addSubview(headerLabel)
+
+        let textLabel = NSTextField(wrappingLabelWithString: text)
+        textLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        textLabel.textColor = .labelColor
+        textLabel.backgroundColor = .clear
+        textLabel.isBezeled = false
+        textLabel.isEditable = false
+        textLabel.maximumNumberOfLines = 6
+        textLabel.lineBreakMode = .byTruncatingTail
+        textLabel.preferredMaxLayoutWidth = textWidth
+
+        let textSize = textLabel.sizeThatFits(NSSize(width: textWidth, height: 120))
+        let bubbleHeight = min(textSize.height + 40, 160)
+
+        textLabel.frame = NSRect(x: textPadding, y: 20, width: textWidth, height: bubbleHeight - 40)
+        headerLabel.frame.origin.y = bubbleHeight - 18
+        bubble.frame.size.height = bubbleHeight
+
+        bubble.addSubview(textLabel)
+        container.addSubview(bubble)
+        liveTextBubble = bubble
+
+        window.setContentSize(NSSize(width: bubbleWidth, height: bubbleHeight))
+        container.frame = NSRect(x: 0, y: 0, width: bubbleWidth, height: bubbleHeight)
+
+        if let screen = NSScreen.main {
+            let x = (screen.frame.width - bubbleWidth) / 2
+            window.setFrameOrigin(NSPoint(x: x, y: window.frame.origin.y))
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.resetToIdle()
+        }
+    }
+}
+
+extension Notification.Name {
+    static let transcribeFile = Notification.Name("transcribeFile")
+}
+
+final class DropView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let types = sender.draggingPasteboard.types, types.contains(.fileURL) else { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] else { return false }
+        let audioExtensions = ["m4a", "mp3", "wav", "ogg", "opus", "aiff", "aac", "flac"]
+        for url in urls {
+            if audioExtensions.contains(url.pathExtension.lowercased()) {
+                NotificationCenter.default.post(name: .transcribeFile, object: url)
+                return true
+            }
+        }
+        return false
     }
 }

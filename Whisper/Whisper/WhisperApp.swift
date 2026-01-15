@@ -106,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+        requestPermissions()
         setupStatusItem()
         setupHotkeyMonitor()
         screenGlow = ScreenGlow()
@@ -121,6 +122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         if let monitor = flagsMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    private func requestPermissions() {
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        if !AXIsProcessTrusted() {
+            AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
+        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
